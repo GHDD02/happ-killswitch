@@ -7,7 +7,7 @@ Before=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/happ-killswitch on
+ExecStart=/usr/sbin/nft -f /etc/happ-killswitch.nft
 RemainAfterExit=yes
 
 [Install]

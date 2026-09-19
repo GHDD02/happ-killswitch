@@ -293,9 +293,8 @@ $LANELEMS
 }
 NFTEOF
 
-    if ! systemctl restart happ-killswitch.service 2>/dev/null; then
-        /usr/sbin/nft -f "$CONF"
-    fi
+    /usr/sbin/nft -f "$CONF"
+    systemctl restart happ-killswitch.service 2>/dev/null || true
     systemctl restart happ-killswitch-cgroup.service 2>/dev/null || true
 }
 
@@ -546,6 +545,7 @@ show_status() {
 # Turn Off
 turn_off() {
     check_root
+    systemctl stop happ-killswitch.service 2>/dev/null || true
     systemctl stop happ-killswitch-cgroup.service 2>/dev/null || true
     if /usr/sbin/nft delete table inet happkill 2>/dev/null; then
         echo -e "\n${C_GREEN}${C_BOLD}[✓] Kill Switch DISABLED${C_RESET} — Network firewall filter removed, traffic unblocked.\n"
@@ -577,7 +577,7 @@ Before=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/happ-killswitch on
+ExecStart=/usr/sbin/nft -f /etc/happ-killswitch.nft
 RemainAfterExit=yes
 
 [Install]
