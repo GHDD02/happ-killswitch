@@ -272,8 +272,8 @@ $LANELEMS
         ip6 daddr @servers6 accept
         ip daddr @lan4 accept
 
-        # Fast IPv6 reject to eliminate browser timeouts
-        meta nfproto ipv6 reject with icmpv6 type no-route
+        # Drop IPv6 to eliminate timeouts
+        meta nfproto ipv6 drop
 
         # Strict Kill Switch: block everything else
         oifname != "lo" drop
