@@ -516,7 +516,7 @@ show_status() {
 
     echo -e "\n${C_BOLD}${C_CYAN}==================== [ HAPP KILL SWITCH STATUS ] ====================${C_RESET}"
     local TABLE_EXISTS
-    TABLE_EXISTS=$(/usr/sbin/nft list table inet happkill 2>/dev/null)
+    TABLE_EXISTS=$(/usr/sbin/nft list table inet happkill 2>/dev/null || true)
     if [ -n "$TABLE_EXISTS" ] || systemctl is-active --quiet happ-killswitch.service 2>/dev/null; then
         echo -e "🔒  Kill Switch:         ${C_GREEN}${C_BOLD}[ ACTIVE - 100% ISOLATION ]${C_RESET}"
     else
@@ -645,8 +645,7 @@ do_uninstall() {
 
 # Help text
 show_help() {
-    cat <<EOF
-
+    echo -e "
 ${C_BOLD}Happ VPN Bulletproof Kill Switch & Identity Shield v${VERSION}${C_RESET}
 
 ${C_BOLD}USAGE:${C_RESET}
@@ -670,8 +669,7 @@ ${C_BOLD}COMMANDS:${C_RESET}
 ${C_BOLD}OPTIONS:${C_RESET}
     --json       Output status formatted as JSON (for status command).
     -h, --help   Show this help message.
-
-EOF
+"
 }
 
 # Entrypoint router
