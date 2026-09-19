@@ -1,0 +1,14 @@
+[Unit]
+Description=Happ VPN Bulletproof Kill Switch
+DefaultDependencies=no
+After=systemd-modules-load.service
+Wants=network-pre.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/happ-killswitch on
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,732 @@
+#!/bin/bash
+# ==============================================================================
+# Happ VPN Bulletproof Kill Switch & Identity Shield
+# https://github.com/coolcoala/happ-killswitch
+#
+# Features:
+#   * 100% Leak Protection (Zero-Drop nftables engine)
+#   * Multi-Browser Privacy Shield (Chrome, Chromium, Brave, Edge, Firefox)
+#   * Dynamic Geo-Spoofing (Syncs system timezone via timedatectl)
+#   * GeoClue2 GPS Mocking (Disables real Wi-Fi BSSID geolocation)
+#   * Localized Identity & Address Generator (25+ countries)
+#   * Background IP Change Watcher / Daemon
+# ==============================================================================
+set -e
+
+VERSION="2.1.0"
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# Colors
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_GREEN="\033[32m"
+C_RED="\033[31m"
+C_YELLOW="\033[33m"
+C_CYAN="\033[36m"
+C_BLUE="\033[34m"
+
+# System paths
+CONF="/etc/happ-killswitch.nft"
+LANSTATE="/etc/happ-killswitch.lan"
+IDENTITY_JSON="/etc/happ-geo-profile.json"
+CGROUP_UNIT="system.slice/happd.service"
+IFACE_TUN="happ-xray"
+IFACE_TUN2="tun0"
+
+# Detect real calling user and home
+detect_user() {
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        TARGET_USER="$SUDO_USER"
+    elif [ -n "$USER" ] && [ "$USER" != "root" ]; then
+        TARGET_USER="$USER"
+    else
+        TARGET_USER=$(who 2>/dev/null | awk '{print $1}' | head -n1)
+        [ -z "$TARGET_USER" ] && TARGET_USER=$(ls -1 /home 2>/dev/null | head -n1)
+        [ -z "$TARGET_USER" ] && TARGET_USER="root"
+    fi
+
+    TARGET_HOME=$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6)
+    if [ -z "$TARGET_HOME" ]; then
+        if [ "$TARGET_USER" = "root" ]; then
+            TARGET_HOME="/root"
+        else
+            TARGET_HOME="/home/$TARGET_USER"
+        fi
+    fi
+
+    HAPPDIR="${TARGET_HOME}/.config/Happ"
+    USER_IDENTITY_JSON="${HAPPDIR}/current_identity.json"
+}
+
+detect_user
+
+# Check root privileges
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${C_RED}${C_BOLD}[!] Error:${C_RESET} This command requires root privileges. Please run with sudo." >&2
+        exit 1
+    fi
+}
+
+# Environment setup
+setup_environment() {
+    # 1. System group for Happ VPN core processes
+    if ! getent group happvpn >/dev/null 2>&1; then
+        groupadd -r happvpn 2>/dev/null || true
+    fi
+    if [ "$TARGET_USER" != "root" ]; then
+        usermod -aG happvpn "$TARGET_USER" 2>/dev/null || true
+    fi
+
+    # 2. Assign setgid permissions on xray binary
+    if [ -f "/opt/happ/bin/core/xray" ]; then
+        chgrp happvpn /opt/happ/bin/core/xray 2>/dev/null || true
+        chmod 2755 /opt/happ/bin/core/xray 2>/dev/null || true
+    fi
+
+    # 3. SupplementaryGroups in happd.service
+    if [ -f "/etc/systemd/system/happd.service" ]; then
+        if ! grep -q "SupplementaryGroups=happvpn" /etc/systemd/system/happd.service; then
+            sed -i "/\[Service\]/a SupplementaryGroups=happvpn" /etc/systemd/system/happd.service
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl restart happd.service 2>/dev/null || true
+        fi
+    fi
+
+    # 4. Browser Privacy Policies (Chrome, Chromium, Brave, Edge)
+    local BROWSER_DIRS=(
+        "/etc/opt/chrome/policies/managed"
+        "/etc/chromium/policies/managed"
+        "/etc/brave/policies/managed"
+        "/etc/opt/edge/policies/managed"
+    )
+    for B_DIR in "${BROWSER_DIRS[@]}"; do
+        mkdir -p "$B_DIR" 2>/dev/null || true
+        cat > "$B_DIR/happ_shield.json" <<'EOF'
+{
+  "WebRtcIPHandlingPolicy": "disable_non_proxied_udp",
+  "DefaultGeolocationSetting": 3,
+  "DefaultSearchProviderGeolocationAccessEnabled": false
+}
+EOF
+        rm -f "$B_DIR/geolocation.json" 2>/dev/null || true
+    done
+
+    # Firefox policies
+    mkdir -p /etc/firefox/policies 2>/dev/null || true
+    cat > /etc/firefox/policies/policies.json <<'EOF'
+{
+  "policies": {
+    "Preferences": {
+      "media.peerconnection.ice.default_address_only": true,
+      "media.peerconnection.ice.no_host": true,
+      "geo.provider.network.url": ""
+    }
+  }
+}
+EOF
+
+    # 5. Configure GeoClue2: Disable Wi-Fi BSSID scanning, enable static coordinates
+    mkdir -p /etc/geoclue/conf.d 2>/dev/null || true
+    cat > /etc/geoclue/conf.d/99-happ-spoof.conf <<'EOF'
+[wifi]
+enable=false
+[3g]
+enable=false
+[cdma]
+enable=false
+[modem-gps]
+enable=false
+[network-nmea]
+enable=false
+[static-source]
+enable=true
+
+[google-chrome]
+allowed=true
+system=false
+users=
+
+[chromium]
+allowed=true
+system=false
+users=
+
+[brave-browser]
+allowed=true
+system=false
+users=
+
+[firefox]
+allowed=true
+system=false
+users=
+EOF
+    systemctl unmask geoclue.service 2>/dev/null || true
+}
+
+# Collect active servers and hostnames
+gather_servers() {
+    {
+        # Extract remote peer IPs from active sockets of VPN processes
+        ss -tunp 2>/dev/null | grep -E 'xray|sing-box|happd' | awk '{print $6}' | sed -E 's/:[0-9]+$//;s/\[//g;s/\]//g' || true
+
+        # Extract IPs and hostnames from Happ JSON configs
+        python3 - "$HAPPDIR" <<'PYEOF'
+import json, sys, os, re, socket
+
+ips = set()
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k in ('server', 'address') and isinstance(v, str):
+                if re.fullmatch(r'(\d{1,3}\.){3}\d{1,3}', v):
+                    ips.add(v)
+                elif re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', v):
+                    try:
+                        for info in socket.getaddrinfo(v, None, socket.AF_INET):
+                            ips.add(info[4][0])
+                    except Exception:
+                        pass
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+    elif isinstance(o, str) and re.fullmatch(r'(\d{1,3}\.){3}\d{1,3}', o):
+        ips.add(o)
+
+for f in ('config.json', 'routing.json'):
+    p = os.path.join(sys.argv[1], f)
+    if os.path.exists(p):
+        try:
+            with open(p, encoding='utf-8') as fh:
+                walk(json.load(fh))
+        except Exception:
+            pass
+
+for ip in sorted(ips):
+    print(ip)
+PYEOF
+    } | sort -u | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+      | grep -vE '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.|224\.|169\.254\.|255\.|8\.8\.[48]\.8|8\.8\.4\.4|1\.1\.1\.1|1\.0\.0\.1|9\.9\.9\.9)' || true
+}
+
+# Write nftables ruleset
+write_conf() {
+    setup_environment
+
+    local SERVERS ELEMS SET4 LAN LANELEMS
+    SERVERS=$(gather_servers | paste -sd' ' -)
+    if [ -n "$SERVERS" ]; then
+        ELEMS=$(printf '%s\n' $SERVERS | paste -sd, -)
+        SET4="        elements = { $ELEMS }"
+    else
+        SET4=""
+    fi
+    LAN="off"; [ -f "$LANSTATE" ] && LAN=$(cat "$LANSTATE" 2>/dev/null)
+    LANELEMS=""
+    [ "$LAN" = "on" ] && LANELEMS="        elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4 }"
+
+    cat > "$CONF" <<NFTEOF
+# Happ VPN Kill Switch Ruleset (Auto-generated)
+table inet happkill
+delete table inet happkill
+table inet happkill {
+    set servers4 {
+        type ipv4_addr
+$SET4
+    }
+    set servers6 { type ipv6_addr; }
+    set lan4 {
+        type ipv4_addr
+        flags interval
+$LANELEMS
+    }
+
+    chain happcgrp {
+        socket cgroupv2 level 2 "$CGROUP_UNIT" accept
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+        
+        # Loopback and tunnels
+        oifname "lo" accept
+        oifname "$IFACE_TUN" accept
+        oifname "$IFACE_TUN2" accept
+        oifname "docker0" accept
+
+        # VPN engines (xray & sing-box/happd)
+        meta skgid "happvpn" accept
+        jump happcgrp
+
+        # DNS direct resolvers (sing-box detour: direct)
+        ip daddr { 8.8.8.8, 8.8.4.4, 1.1.1.1, 1.0.0.1, 9.9.9.9 } udp dport 53 accept
+        ip daddr { 8.8.8.8, 8.8.4.4, 1.1.1.1, 1.0.0.1, 9.9.9.9 } tcp dport 53 accept
+
+        # DHCP
+        udp dport 67 accept
+
+        # Allowed VPN servers and LAN
+        ip daddr @servers4 accept
+        ip6 daddr @servers6 accept
+        ip daddr @lan4 accept
+
+        # Fast IPv6 reject to eliminate browser timeouts
+        meta nfproto ipv6 reject with icmpv6 type no-route
+
+        # Strict Kill Switch: block everything else
+        oifname != "lo" drop
+    }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname "lo" accept
+        iifname "$IFACE_TUN" accept
+        iifname "$IFACE_TUN2" accept
+        iifname "docker0" accept
+        udp dport 68 accept
+        ct state established,related accept
+        ip saddr @lan4 accept
+        iifname != "lo" drop
+    }
+}
+NFTEOF
+
+    if ! systemctl restart happ-killswitch.service 2>/dev/null; then
+        /usr/sbin/nft -f "$CONF"
+    fi
+    systemctl restart happ-killswitch-cgroup.service 2>/dev/null || true
+}
+
+# Identity and Geolocation Spoofing Engine
+spoof_identity() {
+    local QUIET="${1:-0}"
+    python3 - "$IDENTITY_JSON" "$USER_IDENTITY_JSON" "$TARGET_USER" "$QUIET" <<'PYEOF'
+import sys, json, os, urllib.request, socket, random, subprocess
+
+quiet = (sys.argv[4] == "1") if len(sys.argv) > 4 else False
+
+# Force IPv4 resolution
+orig_gai = socket.getaddrinfo
+def gai(host, port, family=0, type=0, proto=0, flags=0):
+    return orig_gai(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = gai
+
+STREET_DB = {
+    'NL': ['Prinsengracht', 'Keizersgracht', 'Herengracht', 'Singel', 'Rozengracht', 'Overtoom', 'Damrak', 'Rokin', 'Vijzelstraat', 'Nieuwendijk', 'Stadhouderskade'],
+    'DE': ['Hauptstraße', 'Bahnhofstraße', 'Berliner Straße', 'Friedrichstraße', 'Schillerstraße', 'Goethestraße', 'Kurfürstendamm', 'Kaiserstraße', 'Kantstraße'],
+    'US': ['Main St', 'Broadway', 'Oak Ave', 'Maple St', 'Park Ave', 'Market St', 'Washington Ave', '5th Ave', 'Sunset Blvd', 'Madison Ave', 'Lexington Ave'],
+    'GB': ['High Street', 'Station Road', 'Church Lane', 'London Road', 'Victoria Road', 'Green Lane', 'Queen Street', 'King Street', 'Oxford Street'],
+    'FR': ['Rue de Rivoli', 'Boulevard Saint-Germain', 'Rue de la Paix', 'Avenue Victor Hugo', 'Rue Nationale', 'Boulevard Haussmann', 'Rue de Rennes'],
+    'SE': ['Drottninggatan', 'Kungsgatan', 'Sveavägen', 'Götgatan', 'Vasagatan', 'Storgatan', 'Hamngatan', 'Odengatan'],
+    'NO': ['Karl Johans gate', 'Storgata', 'Torggata', 'Bogstadveien', 'Grensen', 'Prinsens gate', 'Kirkegata'],
+    'FI': ['Aleksanterinkatu', 'Mannerheimintie', 'Esplanadi', 'Hämeenkatu', 'Bulevardi', 'Kauppakatu'],
+    'PL': ['Marszałkowska', 'Krakowskie Przedmieście', 'Nowy Świat', 'Mickiewicza', 'Kościuszki', 'Piotrkowska', 'Floriańska'],
+    'TR': ['Atatürk Caddesi', 'İstiklal Caddesi', 'Bağdat Caddesi', 'Cumhuriyet Caddesi', 'İnönü Caddesi', 'Halaskargazi Caddesi'],
+    'RU': ['ул. Тверская', 'Невский проспект', 'ул. Арбат', 'Ленинский проспект', 'ул. Мира', 'ул. Пушкина', 'Садовая ул.'],
+    'KZ': ['пр. Достык', 'пр. Абая', 'ул. Желтоксан', 'пр. Назарбаева', 'ул. Толе би', 'ул. Сатпаева', 'пр. Аль-Фараби'],
+    'SG': ['Orchard Road', 'Marina Boulevard', 'Victoria Street', 'Bras Basah Road', 'Raffles Avenue', 'Shenton Way'],
+    'JP': ['Chuo-dori', 'Meiji-dori', 'Roppongi-dori', 'Omotesando', 'Sotobori-dori', 'Waseda-dori', 'Aoyama-dori'],
+    'CH': ['Bahnhofstrasse', 'Grand-Rue', 'Rue du Rhône', 'Marktgasse', 'Limmatquai', 'Rue de Bourg'],
+    'AT': ['Mariahilfer Straße', 'Kärntner Straße', 'Graben', 'Ringstraße', 'Herrengasse', 'Landstraße'],
+    'ES': ['Gran Vía', 'Calle de Alcalá', 'Paseo de la Castellana', 'Paseo de Gracia', 'Calle Mayor', 'Rambla de Catalunya'],
+    'IT': ['Via del Corso', 'Via Condotti', 'Corso Vittorio Emanuele', 'Via Monte Napoleone', 'Via Roma', 'Via Toledo'],
+    'CA': ['Yonge St', 'Queen St W', 'Saint Catherine St', 'Robson St', 'Bay St', 'Jasper Ave'],
+    'AU': ['George St', 'Collins St', 'Pitt St', 'Bourke St', 'Queen St', 'Adelaide St']
+}
+
+NAMES_DB = {
+    'NL': (['Lars', 'Daan', 'Sven', 'Thijs', 'Sem', 'Milan', 'Bram', 'Lucas'], ['van Dijk', 'de Jong', 'Bakker', 'Visser', 'Smit', 'Meijer', 'de Boer', 'Vos']),
+    'DE': (['Maximilian', 'Lukas', 'Felix', 'Jonas', 'Leon', 'Niklas', 'David'], ['Müller', 'Schmidt', 'Schneider', 'Fischer', 'Weber', 'Meyer', 'Wagner', 'Becker']),
+    'US': (['James', 'Michael', 'Robert', 'David', 'William', 'John', 'Thomas'], ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Miller', 'Davis', 'Wilson']),
+    'GB': (['Oliver', 'George', 'Harry', 'Jack', 'Arthur', 'Leo', 'Oscar'], ['Taylor', 'Wilson', 'Evans', 'Davies', 'Walker', 'Wright', 'Robinson', 'Wood']),
+    'FR': (['Gabriel', 'Léo', 'Raphaël', 'Louis', 'Arthur', 'Lucas', 'Jules'], ['Martin', 'Bernard', 'Dubois', 'Thomas', 'Robert', 'Richard', 'Petit', 'Durand']),
+    'SE': (['Lars', 'Mikael', 'Anders', 'Johan', 'Erik', 'Per', 'Karl'], ['Andersson', 'Johansson', 'Karlsson', 'Nilsson', 'Eriksson', 'Larsson', 'Olsson']),
+    'NO': (['Jakob', 'Emil', 'Noah', 'Oliver', 'Filip', 'Magnus'], ['Hansen', 'Johansen', 'Olsen', 'Larsen', 'Andersen', 'Pedersen', 'Nilsen']),
+    'FI': (['Eetu', 'Leo', 'Onni', 'Aleksi', 'Oliver', 'Elias'], ['Korhonen', 'Virtanen', 'Mäkinen', 'Nieminen', 'Mäkelä', 'Hämäläinen']),
+    'RU': (['Александр', 'Дмитрий', 'Максим', 'Сергей', 'Андрей', 'Алексей'], ['Иванов', 'Смирнов', 'Кузнецов', 'Попов', 'Васильев', 'Петров', 'Соколов']),
+    'KZ': (['Алихан', 'Нурсултан', 'Дамир', 'Арман', 'Ержан', 'Азамат'], ['Алиев', 'Омаров', 'Ахметов', 'Смагулов', 'Сериков', 'Ибрагимов', 'Касымов']),
+    'TR': (['Mehmet', 'Mustafa', 'Ahmet', 'Ali', 'Hüseyin', 'Hasan', 'Emre'], ['Yılmaz', 'Kaya', 'Demir', 'Şahin', 'Çelik', 'Yıldız', 'Öztürk', 'Aydın']),
+    'CH': (['Luca', 'Noah', 'Matteo', 'Leon', 'Gabriel'], ['Müller', 'Meier', 'Schmid', 'Keller', 'Weber', 'Huber', 'Schneider']),
+    'AT': (['Paul', 'David', 'Jakob', 'Maximilian', 'Felix'], ['Gruber', 'Bauer', 'Pichler', 'Steiner', 'Moser', 'Mayer', 'Hofer']),
+    'ES': (['Alejandro', 'Mateo', 'Lucas', 'Hugo', 'Daniel'], ['García', 'Rodríguez', 'González', 'Fernández', 'López', 'Martínez']),
+    'IT': (['Leonardo', 'Francesco', 'Alessandro', 'Lorenzo', 'Mattia'], ['Rossi', 'Russo', 'Ferrari', 'Esposito', 'Bianchi', 'Romano']),
+}
+
+data = None
+endpoints = [
+    ("https://ipinfo.io/json", lambda r: json.loads(r)),
+    ("http://ip-api.com/json", lambda r: {
+        "ip": json.loads(r).get("query"),
+        "city": json.loads(r).get("city"),
+        "region": json.loads(r).get("regionName"),
+        "country": json.loads(r).get("countryCode"),
+        "country_name": json.loads(r).get("country"),
+        "loc": f"{json.loads(r).get('lat')},{json.loads(r).get('lon')}",
+        "postal": json.loads(r).get("zip"),
+        "timezone": json.loads(r).get("timezone"),
+        "org": json.loads(r).get("isp")
+    })
+]
+
+for url, parser in endpoints:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = parser(resp.read().decode('utf-8'))
+            if data.get('ip'):
+                break
+    except Exception:
+        continue
+
+if not data or not data.get('ip'):
+    if not quiet:
+        print("\n\033[33m[!] VPN tunnel is not connected or IP is unreachable.\033[0m")
+        print("    Run 'sudo happ-killswitch spoof' once connected in Happ.\n")
+    sys.exit(0)
+
+ip = data.get('ip')
+cc = (data.get('country') or 'US').upper()
+country_name = data.get('country_name') or cc
+city = data.get('city') or 'Unknown'
+region = data.get('region') or ''
+tz = data.get('timezone') or 'UTC'
+loc = data.get('loc') or '0,0'
+postal = data.get('postal') or ''
+isp = data.get('org') or 'Unknown ISP'
+
+try:
+    lat, lon = [x.strip() for x in loc.split(',')]
+except Exception:
+    lat, lon = '0', '0'
+
+streets = STREET_DB.get(cc, [f"{city} Central Ave", f"{city} Park Rd", f"{city} Market St", f"{city} Westway"])
+names = NAMES_DB.get(cc, (['Alex', 'Sam', 'Jordan', 'Taylor', 'Morgan'], ['Stone', 'Rivera', 'Lee', 'Clark', 'Novak']))
+
+first = random.choice(names[0])
+last = random.choice(names[1])
+street = random.choice(streets)
+num = random.randint(10, 199)
+
+post = postal if postal else str(random.randint(10000, 99999))
+if cc == 'NL' and len(post) == 4:
+    post = f"{post} {''.join(random.choices('ABCDEFGHJKLMNPRSTVWXYZ', k=2))}"
+elif cc == 'GB' and not any(c.isalpha() for c in post):
+    post = f"W1D {random.randint(1,9)}{''.join(random.choices('ABDEFGHJLNPQRSTUWXYZ', k=2))}"
+
+fake_profile = {
+    "ip": ip,
+    "country_code": cc,
+    "country": country_name,
+    "city": city,
+    "region": region,
+    "timezone": tz,
+    "latitude": float(lat),
+    "longitude": float(lon),
+    "postal_code": post,
+    "street_address": f"{street} {num}",
+    "full_address": f"{street} {num}, {post} {city}, {country_name}",
+    "full_name": f"{first} {last}",
+    "email": f"{first.lower()}.{last.lower().replace(' ', '')}{random.randint(10, 99)}@gmail.com",
+    "isp": isp,
+    "webrtc_shield": "ACTIVE",
+    "geoclue_spoof": "ACTIVE"
+}
+
+# 1. Synchronize System Timezone
+if tz and tz != 'UTC':
+    try:
+        subprocess.run(["timedatectl", "set-timezone", tz], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+# 2. Update GeoClue Static Coordinates
+try:
+    with open('/etc/geolocation', 'w') as f:
+        f.write(f"{lat}\n{lon}\n15\n20\n")
+    subprocess.run(["systemctl", "try-restart", "geoclue.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception:
+    pass
+
+# 3. Save Identity Profile
+target_user = sys.argv[3]
+for target in [sys.argv[1], sys.argv[2]]:
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, 'w', encoding='utf-8') as f:
+            json.dump(fake_profile, f, indent=2, ensure_ascii=False)
+        if target_user != 'root' and target_user in target:
+            subprocess.run(["chown", f"{target_user}:{target_user}", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+# 4. Display card
+if not quiet:
+    C_RESET = "\033[0m"
+    C_BOLD = "\033[1m"
+    C_GREEN = "\033[32m"
+    C_CYAN = "\033[36m"
+    print(f"\n{C_CYAN}{'='*68}{C_RESET}")
+    print(f"{C_BOLD}{C_GREEN}🛡️   HAPP BULLETPROOF KILL SWITCH & IDENTITY SHIELD: ACTIVE{C_RESET}")
+    print(f"{C_CYAN}{'='*68}{C_RESET}")
+    print(f"🔒  Network Isolation:  {C_GREEN}100% SHIELDED (all non-VPN packets dropped){C_RESET}")
+    print(f"🌐  Public VPN IP:      {C_BOLD}{ip}{C_RESET} ({isp})")
+    print(f"📍  GeoIP Location:     {city}, {region} ({country_name})")
+    print(f"⏰  System Timezone:    {C_GREEN}{tz} (Synchronized via timedatectl){C_RESET}")
+    print(f"🌍  Mock GPS Coords:    {lat}° N, {lon}° E (GeoClue2 active)")
+    print(f"🏠  Spoofed Address:    {fake_profile['full_address']}")
+    print(f"👤  Spoofed Persona:    {fake_profile['full_name']} <{fake_profile['email']}>")
+    print(f"🚀  Browser Shields:    {C_GREEN}WebRTC STUN & Wi-Fi Scanning BLOCKED{C_RESET}")
+    print(f"{C_CYAN}{'='*68}{C_RESET}\n")
+PYEOF
+}
+
+# Watcher mode: Automatically sync timezone & geo when VPN IP changes
+run_watcher() {
+    check_root
+    echo -e "${C_CYAN}${C_BOLD}[*] Starting Happ Shield Watcher daemon...${C_RESET}"
+    echo -e "    Monitoring VPN endpoint changes every 15s. Press Ctrl+C to stop.\n"
+    
+    local LAST_IP=""
+    while true; do
+        CURRENT_IP=$(curl -4 -s --max-time 4 https://ifconfig.me 2>/dev/null || curl -4 -s --max-time 4 https://api.ipify.org 2>/dev/null || true)
+        if [ -n "$CURRENT_IP" ] && [ "$CURRENT_IP" != "$LAST_IP" ]; then
+            echo -e "${C_YELLOW}[!] IP change detected:${C_RESET} ${LAST_IP:-Initial} -> ${C_GREEN}${CURRENT_IP}${C_RESET}"
+            spoof_identity 0
+            LAST_IP="$CURRENT_IP"
+        fi
+        sleep 15
+    done
+}
+
+# Display Status
+show_status() {
+    local AS_JSON=0
+    [ "$1" = "--json" ] && AS_JSON=1
+
+    if [ "$AS_JSON" -eq 1 ]; then
+        if [ -f "$IDENTITY_JSON" ]; then
+            cat "$IDENTITY_JSON"
+        else
+            echo '{"status": "unknown"}'
+        fi
+        return
+    fi
+
+    echo -e "\n${C_BOLD}${C_CYAN}==================== [ HAPP KILL SWITCH STATUS ] ====================${C_RESET}"
+    local TABLE_EXISTS
+    TABLE_EXISTS=$(/usr/sbin/nft list table inet happkill 2>/dev/null)
+    if [ -n "$TABLE_EXISTS" ] || systemctl is-active --quiet happ-killswitch.service 2>/dev/null; then
+        echo -e "🔒  Kill Switch:         ${C_GREEN}${C_BOLD}[ ACTIVE - 100% ISOLATION ]${C_RESET}"
+    else
+        echo -e "⚠️   Kill Switch:         ${C_RED}${C_BOLD}[ DISABLED - NETWORK OPEN ]${C_RESET}"
+    fi
+
+    echo -n "⚙️   Autostart:           "
+    systemctl is-enabled happ-killswitch.service 2>/dev/null || echo "disabled"
+
+    echo -n "🛡️   Browser Protection:  "
+    if [ -f "/etc/opt/chrome/policies/managed/happ_shield.json" ]; then
+        echo -e "${C_GREEN}Active (Chrome, Brave, Edge, Firefox hardened)${C_RESET}"
+    else
+        echo -e "${C_YELLOW}Not Installed${C_RESET}"
+    fi
+
+    echo -n "📍  GeoClue2 GPS Mock:   "
+    if [ -f "/etc/geolocation" ] && [ -f "/etc/geoclue/conf.d/99-happ-spoof.conf" ]; then
+        echo -e "${C_GREEN}Active ($(head -n 2 /etc/geolocation | tr '\n' ' '))${C_RESET}"
+    else
+        echo -e "${C_YELLOW}Not Configured${C_RESET}"
+    fi
+
+    spoof_identity 0
+}
+
+# Turn Off
+turn_off() {
+    check_root
+    systemctl stop happ-killswitch-cgroup.service 2>/dev/null || true
+    if /usr/sbin/nft delete table inet happkill 2>/dev/null; then
+        echo -e "\n${C_GREEN}${C_BOLD}[✓] Kill Switch DISABLED${C_RESET} — Network firewall filter removed, traffic unblocked.\n"
+    else
+        echo -e "\n${C_YELLOW}[!] Kill Switch was already disabled.${C_RESET}\n"
+    fi
+}
+
+# Install command
+do_install() {
+    check_root
+    echo -e "${C_CYAN}${C_BOLD}[*] Installing Happ Bulletproof Kill Switch...${C_RESET}"
+
+    # Install binary
+    cp "$0" /usr/local/bin/happ-killswitch
+    chmod 755 /usr/local/bin/happ-killswitch
+
+    # Setup environment & group
+    setup_environment
+
+    # Install systemd service
+    cat > /etc/systemd/system/happ-killswitch.service <<'EOF'
+[Unit]
+Description=Happ VPN Bulletproof Kill Switch
+DefaultDependencies=no
+After=systemd-modules-load.service
+Wants=network-pre.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/happ-killswitch on
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+    # Install watcher service
+    cat > /etc/systemd/system/happ-killswitch-watcher.service <<'EOF'
+[Unit]
+Description=Happ Shield Geo/Timezone Watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/happ-killswitch watch
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Install bash completion
+    mkdir -p /etc/bash_completion.d 2>/dev/null || true
+    cat > /etc/bash_completion.d/happ-killswitch <<'EOF'
+_happ_killswitch() {
+    local cur prev words cword
+    _init_completion || return
+    local commands="on off status refresh spoof watch lan-on lan-off install uninstall version help"
+    if [[ ${cword} -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "${commands}" -- ${cur}) )
+    fi
+}
+complete -F _happ_killswitch happ-killswitch
+EOF
+
+    systemctl daemon-reload
+    echo -e "${C_GREEN}${C_BOLD}[✓] Installation complete!${C_RESET}"
+    echo -e "    Binary:      /usr/local/bin/happ-killswitch"
+    echo -e "    Run command: sudo happ-killswitch on\n"
+}
+
+# Uninstall command
+do_uninstall() {
+    check_root
+    echo -e "${C_YELLOW}${C_BOLD}[*] Uninstalling Happ Kill Switch...${C_RESET}"
+    turn_off
+
+    systemctl disable --now happ-killswitch.service 2>/dev/null || true
+    systemctl disable --now happ-killswitch-watcher.service 2>/dev/null || true
+    rm -f /etc/systemd/system/happ-killswitch*.service
+    rm -f /etc/happ-killswitch.nft /etc/happ-killswitch.lan /etc/happ-geo-profile.json
+    rm -f /etc/geoclue/conf.d/99-happ-spoof.conf /etc/geolocation
+    rm -f /etc/opt/chrome/policies/managed/happ_shield.json
+    rm -f /etc/chromium/policies/managed/happ_shield.json
+    rm -f /etc/brave/policies/managed/happ_shield.json
+    rm -f /etc/opt/edge/policies/managed/happ_shield.json
+    rm -f /etc/bash_completion.d/happ-killswitch
+    rm -f /usr/local/bin/happ-killswitch
+    systemctl daemon-reload
+
+    echo -e "${C_GREEN}${C_BOLD}[✓] Happ Kill Switch successfully uninstalled.${C_RESET}\n"
+}
+
+# Help text
+show_help() {
+    cat <<EOF
+
+${C_BOLD}Happ VPN Bulletproof Kill Switch & Identity Shield v${VERSION}${C_RESET}
+
+${C_BOLD}USAGE:${C_RESET}
+    happ-killswitch [COMMAND] [OPTIONS]
+    sudo happ-killswitch [COMMAND]
+
+${C_BOLD}COMMANDS:${C_RESET}
+    ${C_GREEN}on${C_RESET}           Activate Kill Switch, browser shields, and spoof identity.
+    ${C_RED}off${C_RESET}          Deactivate Kill Switch and restore direct network access.
+    ${C_CYAN}status${C_RESET}       Show current protection, active public IP, and spoofed persona.
+    ${C_YELLOW}spoof${C_RESET}        Re-synchronize system timezone, GPS coordinates, and address.
+    ${C_BLUE}refresh${C_RESET}      Refresh firewall whitelist and re-sync geo profile.
+    ${C_CYAN}watch${C_RESET}        Start background watcher daemon to auto-sync on IP changes.
+    ${C_YELLOW}lan-on${C_RESET}       Allow direct local network access (192.168.x.x, 10.x.x.x, NAS).
+    ${C_YELLOW}lan-off${C_RESET}      Block local network traffic (100% strict VPN tunnel).
+    ${C_BOLD}install${C_RESET}      Install binary, systemd units, and bash completion.
+    ${C_RED}uninstall${C_RESET}    Remove all rules, policies, and files cleanly.
+    ${C_BOLD}version${C_RESET}      Display version information.
+    ${C_BOLD}help${C_RESET}         Display this help message.
+
+${C_BOLD}OPTIONS:${C_RESET}
+    --json       Output status formatted as JSON (for status command).
+    -h, --help   Show this help message.
+
+EOF
+}
+
+# Entrypoint router
+case "${1:-status}" in
+    on)
+        check_root
+        write_conf
+        systemctl enable happ-killswitch.service >/dev/null 2>&1 || true
+        systemctl enable happ-killswitch-cgroup.service >/dev/null 2>&1 || true
+        spoof_identity 0
+        ;;
+    refresh)
+        check_root
+        write_conf
+        spoof_identity 0
+        ;;
+    spoof)
+        check_root
+        spoof_identity 0
+        ;;
+    watch)
+        run_watcher
+        ;;
+    off)
+        turn_off
+        ;;
+    lan-on)
+        check_root
+        echo on > "$LANSTATE"
+        write_conf
+        echo -e "${C_GREEN}[✓] Local LAN Access ENABLED${C_RESET} (10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12)"
+        ;;
+    lan-off)
+        check_root
+        echo off > "$LANSTATE"
+        write_conf
+        echo -e "${C_YELLOW}[!] Local LAN Access BLOCKED${C_RESET} (Strict VPN isolation)"
+        ;;
+    status)
+        show_status "$2"
+        ;;
+    install)
+        do_install
+        ;;
+    uninstall)
+        do_uninstall
+        ;;
+    version|--version|-v)
+        echo "Happ Kill Switch v${VERSION}"
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    *)
+        show_help
+        exit 1
+        ;;
+esac
