@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # Happ VPN Bulletproof Kill Switch & Identity Shield
-# https://github.com/coolcoala/happ-killswitch
+# https://github.com/sunatillo-muratov/happ-killswitch
 #
 # Features:
 #   * 100% Leak Protection (Zero-Drop nftables engine)

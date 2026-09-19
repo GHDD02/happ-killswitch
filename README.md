@@ -41,12 +41,12 @@ A high-performance, leak-proof **Kill Switch** and **Automated Identity & Geoloc
 
 ### Option 1: One-Line Installer
 ```bash
-curl -fsSL https://raw.githubusercontent.com/coolcoala/happ-killswitch/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/sunatillo-muratov/happ-killswitch/main/install.sh | sudo bash
 ```
 
 ### Option 2: Clone & Install
 ```bash
-git clone https://github.com/coolcoala/happ-killswitch.git
+git clone https://github.com/sunatillo-muratov/happ-killswitch.git
 cd happ-killswitch
 sudo ./happ-killswitch install
 ```

@@ -10,7 +10,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-REPO_URL="https://raw.githubusercontent.com/coolcoala/happ-killswitch/main"
+REPO_URL="https://raw.githubusercontent.com/sunatillo-muratov/happ-killswitch/main"
 TMP_DIR=$(mktemp -d)
 
 echo "[*] Downloading Happ Kill Switch..."
